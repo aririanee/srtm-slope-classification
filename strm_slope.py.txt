@@ -1,0 +1,127 @@
+# 1. Instalar e importar bibliotecas
+
+!pip install geemap rasterio geopandas shapely scikit-image --quiet
+
+import ee, geemap
+import rasterio
+import numpy as np
+from skimage import measure
+from shapely.geometry import LineString
+import geopandas as gpd
+import time
+from google.colab import drive
+
+# 2. Autenticar
+
+ee.Authenticate()
+ee.Initialize(project='gee-projeto-aplicado')  # Substitua pelo seu
+
+# 3. Montar Drive
+
+drive.mount('/content/drive')
+
+# 4. Criar mapa para desenhar AOI
+
+Map = geemap.Map(center=[-23.5, -47.06], zoom=8)
+Map.add_basemap('SATELLITE')
+Map.add_draw_control()
+Map
+
+# 5. Capturar a AOI desenhada
+
+user_draw = Map.user_roi
+
+if user_draw is None:
+    raise Exception("⚠️ Nenhuma geometria desenhada.")
+elif isinstance(user_draw, dict):
+    aoi = geemap.geojson_to_ee(user_draw)
+elif isinstance(user_draw, ee.Geometry):
+    aoi = user_draw
+else:
+    raise Exception(" Tipo de dado inválido.")
+
+# 6. Obter e recortar a imagem SRTM
+
+srtm = ee.Image("USGS/SRTMGL1_003").clip(aoi)
+
+# 7. Exportar como GeoTIFF para o Drive
+
+export_path = 'srtm_clipado_gee'
+task = ee.batch.Export.image.toDrive(
+    image=srtm,
+    description=export_path,
+    folder='GEE',
+    fileNamePrefix=export_path,
+    scale=30,
+    region=aoi,
+    fileFormat='GeoTIFF'
+)
+task.start()
+
+print("Exportação iniciada...")
+while task.active():
+    print("Aguardando exportação...")
+    time.sleep(30)
+
+print(" Exportação finalizada! Verifique a pasta 'GEE' no seu Google Drive.")
+
+# 8.  Atualize com o caminho real do .tif exportado
+
+caminho_tif = '/content/drive/MyDrive/GEE/srtm_clipado_gee.tif'
+saida_shp = '/content/drive/MyDrive/curvas_nivel.shp'
+
+#  9. Ler raster e gerar curvas
+
+with rasterio.open(caminho_tif) as src:
+    elevation = src.read(1)
+    transform = src.transform
+    nodata = src.nodata
+    elevation = np.where(elevation == nodata, np.nan, elevation)
+
+intervalo = 10  # metros
+min_val, max_val = np.nanmin(elevation), np.nanmax(elevation)
+curvas = np.arange(round(min_val), round(max_val) + intervalo, intervalo)
+
+linhas = []
+for nivel in curvas:
+    contornos = measure.find_contours(elevation, nivel)
+    for c in contornos:
+        coords = [rasterio.transform.xy(transform, y, x) for y, x in c]
+        linha = LineString(coords)
+        if linha.is_valid:
+            linhas.append({'geometry': linha, 'elev': float(nivel)})
+
+gdf = gpd.GeoDataFrame(linhas, crs="EPSG:4326")
+gdf.to_file(saida_shp)
+
+print("Curvas de nível geradas e salvas em:", saida_shp)
+
+from scipy.ndimage import sobel
+
+# 10. Abrir o raster e calcular a declividade
+with rasterio.open(caminho_tif) as src:
+    elevation = src.read(1)
+    transform = src.transform
+    nodata = src.nodata
+    elevation = np.where(elevation == nodata, np.nan, elevation)
+
+    # Salvar o profile aqui, ainda com o arquivo aberto
+    profile = src.profile
+
+# 11. Calcular declividade com base no SRTM
+resolucao = 30  # metros
+dzdx = sobel(elevation, axis=1, mode='constant') / (8.0 * resolucao)
+dzdy = sobel(elevation, axis=0, mode='constant') / (8.0 * resolucao)
+
+slope_rad = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
+slope_deg = np.degrees(slope_rad)
+slope_deg = np.where(np.isnan(elevation), np.nan, slope_deg)
+
+# 12. Exportar como GeoTIFF
+saida_declividade = '/content/drive/MyDrive/declividade_GO9.tif'
+profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
+
+with rasterio.open(saida_declividade, 'w', **profile) as dst:
+    dst.write(slope_deg.astype(rasterio.float32), 1)
+
+print("Mapa de declividade salvo em:", saida_declividade)
